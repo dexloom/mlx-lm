@@ -315,6 +315,8 @@ def generate_step(
     quantized_kv_start: int = 0,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
+    on_prefill_complete: Optional[Callable] = None,
+    prefill_snapshot_at: Optional[int] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -422,10 +424,24 @@ def generate_step(
             len(input_embeddings) if input_embeddings is not None else len(prompt)
         )
         prompt_processed_tokens = 0
+        snapshot_taken = False
         prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
-            n_to_process = min(prefill_step_size, remaining)
+            # If snapshot_at is set, limit chunk size to not exceed it
+            if (
+                on_prefill_complete
+                and not snapshot_taken
+                and prefill_snapshot_at is not None
+                and prompt_processed_tokens < prefill_snapshot_at
+            ):
+                n_to_process = min(
+                    prefill_step_size,
+                    remaining,
+                    prefill_snapshot_at - prompt_processed_tokens,
+                )
+            else:
+                n_to_process = min(prefill_step_size, remaining)
             _model_call(
                 input_tokens=prompt[:n_to_process][None],
                 input_embeddings=(
@@ -445,6 +461,20 @@ def generate_step(
                 else input_embeddings
             )
             mx.clear_cache()
+
+            # Fire snapshot callback at the specified position
+            if (
+                on_prefill_complete
+                and not snapshot_taken
+                and prefill_snapshot_at is not None
+                and prompt_processed_tokens >= prefill_snapshot_at
+            ):
+                on_prefill_complete(prompt_cache)
+                snapshot_taken = True
+
+        # Default: fire callback at end of prefill if no snapshot_at specified
+        if on_prefill_complete and not snapshot_taken:
+            on_prefill_complete(prompt_cache)
 
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
 
@@ -952,6 +982,7 @@ class BatchGenerator:
             Callable[[List[Tuple[int, int, int]]], None]
         ] = None,
         max_kv_size: Optional[int] = None,
+        on_prefill_complete: Optional[Callable] = None,
     ):
         self.model = model
         self.unprocessed_prompts = []
@@ -966,6 +997,7 @@ class BatchGenerator:
         self.prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
         self._stats = BatchStats()
         self.max_kv_size = max_kv_size
+        self.on_prefill_complete = on_prefill_complete
 
         self.active_batch = None
 
@@ -1116,6 +1148,9 @@ class BatchGenerator:
         for c in prompt_cache:
             c.finalize()
         mx.clear_cache()
+
+        if self.on_prefill_complete:
+            self.on_prefill_complete(list(uids), prompt_cache)
 
         y, logprobs = self._step(
             inputs, prompt_cache, samplers, logits_processors, tokens

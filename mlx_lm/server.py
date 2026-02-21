@@ -570,10 +570,10 @@ class ModelProvider:
             self.draft_model, draft_tokenizer = load(draft_model_path)
             validate_draft_tokenizer(draft_tokenizer)
 
+        test_cache = make_prompt_cache(self.model)
         if self.draft_model is None:
-            self.is_batchable = all(
-                hasattr(c, "merge") for c in make_prompt_cache(self.model)
-            )
+            self.is_batchable = all(hasattr(c, "merge") for c in test_cache)
+        self.cache_is_trimmable = can_trim_prompt_cache(test_cache)
 
         return self.model, self.tokenizer
 
@@ -621,12 +621,70 @@ class ResponseGenerator:
         self.prompt_cache = prompt_cache
         self.requests = Queue()
 
+        # Separate cache for prompt-boundary snapshots of non-trimmable
+        # (hybrid) models. Keyed by (model_key, tuple(prompt_tokens)).
+        # Bypasses the LRU entirely to avoid interference.
+        # Supports both exact matching and prefix matching (for growing
+        # agentic prompts where each turn extends the previous one).
+        self._prompt_boundary_cache = {}
+        self._prompt_boundary_max = 20
+
         self._time_budget = TimeBudget()
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
         self._stop = False
         self._generation_thread = Thread(target=self._generate)
         self._generation_thread.start()
+
+    def _boundary_cache_lookup(self, model_key, content_tokens):
+        """Look up content tokens in boundary cache: exact match, then longest prefix.
+
+        Args:
+            model_key: Model identifier
+            content_tokens: Prompt tokens WITHOUT the generation prompt
+
+        Returns (cache_copy, rest_content_tokens, hit_type) where hit_type is
+        'exact', 'prefix', or None.
+        """
+        if len(content_tokens) < 1:
+            return None, content_tokens, None
+
+        # 1. Exact match (same content as before)
+        boundary_key = (model_key, tuple(content_tokens))
+        if boundary_key in self._prompt_boundary_cache:
+            cache = copy.deepcopy(self._prompt_boundary_cache[boundary_key])
+            return cache, [], "exact"
+
+        # 2. Prefix match (growing prompt shares content prefix with cached)
+        content_tuple = tuple(content_tokens)
+        best_key = None
+        best_len = 0
+        for key, _ in self._prompt_boundary_cache.items():
+            if key[0] != model_key:
+                continue
+            cached_tokens = key[1]
+            clen = len(cached_tokens)
+            if clen <= best_len or clen >= len(content_tuple):
+                continue
+            if content_tuple[:clen] == cached_tokens:
+                best_key = key
+                best_len = clen
+
+        if best_key is not None:
+            cache = copy.deepcopy(self._prompt_boundary_cache[best_key])
+            return cache, content_tokens[best_len:], "prefix"
+
+        return None, content_tokens, None
+
+    def _boundary_cache_store(self, model_key, content_tokens, snapshot):
+        """Store a prompt-boundary snapshot. Key is content tokens (no gen prompt)."""
+        if len(content_tokens) < 1:
+            return
+        key = (model_key, tuple(content_tokens))
+        self._prompt_boundary_cache[key] = snapshot
+        while len(self._prompt_boundary_cache) > self._prompt_boundary_max:
+            oldest = next(iter(self._prompt_boundary_cache))
+            del self._prompt_boundary_cache[oldest]
 
     def stop_and_join(self):
         self._stop = True
@@ -720,6 +778,11 @@ class ResponseGenerator:
         if args.seed is not None:
             return False
 
+        # Hybrid models (mixed trimmable/non-trimmable caches) must use
+        # _serve_single for correct prompt-boundary snapshotting
+        if not getattr(self.model_provider, "cache_is_trimmable", True):
+            return False
+
         return True
 
     def _generate(self):
@@ -792,12 +855,42 @@ class ResponseGenerator:
                     )
                     rqueue.put(ctx)
 
-                    cache, rest = self.prompt_cache.fetch_nearest_cache(
-                        current_model_key, prompt
+                    # Compute content-only token length for boundary cache
+                    content_len = len(prompt)
+                    if request.request_type == "chat" and current_tokenizer.has_chat_template:
+                        try:
+                            chat_template_args = self.model_provider.cli_args.chat_template_args
+                            if args.chat_template_kwargs:
+                                chat_template_args = chat_template_args.copy()
+                                chat_template_args.update(args.chat_template_kwargs)
+                            content_tokens = current_tokenizer.apply_chat_template(
+                                request.messages,
+                                tools=request.tools,
+                                add_generation_prompt=False,
+                                tokenize=True,
+                                **chat_template_args,
+                            )
+                            content_len = len(content_tokens)
+                        except Exception:
+                            pass
+                    content_prompt = prompt[:content_len]
+
+                    # Check prompt-boundary cache (keyed by content tokens)
+                    boundary_cache, boundary_rest, boundary_hit_type = (
+                        self._boundary_cache_lookup(current_model_key, content_prompt)
                     )
-                    ctx.prompt_cache_count = len(prompt) - len(rest)
-                    if cache is None:
-                        cache = make_prompt_cache(self.model_provider.model)
+
+                    if boundary_cache is not None:
+                        cache = boundary_cache
+                        rest = list(boundary_rest) + prompt[content_len:]
+                        ctx.prompt_cache_count = len(prompt) - len(rest)
+                    else:
+                        cache, rest = self.prompt_cache.fetch_nearest_cache(
+                            current_model_key, prompt
+                        )
+                        ctx.prompt_cache_count = len(prompt) - len(rest)
+                        if cache is None:
+                            cache = make_prompt_cache(self.model_provider.model)
 
                     ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
                     logging.info(
@@ -814,8 +907,12 @@ class ResponseGenerator:
                     batch_results[uid] = {
                         "ctx": ctx,
                         "cache_key": prompt[:],
+                        "prompt_tokens": prompt[:],
+                        "content_prompt": content_prompt,
                         "rqueue": rqueue,
                         "detokenizer": tokenizer.detokenizer,
+                        "needs_prompt_cache": len(rest) > 0 and boundary_hit_type is None,
+                        "stored_prompt_boundary": boundary_hit_type is not None,
                     }
                     # just making sure we don't leave a reference around
                     del cache
@@ -846,12 +943,31 @@ class ResponseGenerator:
                     current_tokenizer = tokenizer
                     current_model_key = self.model_provider.model_key
                     batch_results = {}
+
+                    def on_batch_prefill_complete(uids, cache):
+                        if can_trim_prompt_cache(cache):
+                            return
+                        for e, uid in enumerate(uids):
+                            if uid not in batch_results:
+                                continue
+                            result = batch_results[uid]
+                            if not result.get("needs_prompt_cache"):
+                                continue
+                            content_prompt = result.get("content_prompt", result["prompt_tokens"])
+                            individual_cache = [c.extract(e) for c in cache]
+                            snapshot = copy.deepcopy(individual_cache)
+                            self._boundary_cache_store(
+                                current_model_key, content_prompt, snapshot
+                            )
+                            result["stored_prompt_boundary"] = True
+
                     batch_generator = BatchGenerator(
                         model,
                         stop_tokens=tokenizer.eos_token_ids,
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prompt_progress_callback=progress_callback,
+                        on_prefill_complete=on_batch_prefill_complete,
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue
@@ -902,9 +1018,10 @@ class ResponseGenerator:
 
                         if r.finish_reason is not None:
                             result["rqueue"].put(None)
-                            self.prompt_cache.insert_cache(
-                                current_model_key, result["cache_key"], r.prompt_cache
-                            )
+                            if not result.get("stored_prompt_boundary"):
+                                self.prompt_cache.insert_cache(
+                                    current_model_key, result["cache_key"], r.prompt_cache
+                                )
                             del batch_results[r.uid]
 
                         if result["ctx"]._should_stop:
@@ -920,9 +1037,10 @@ class ResponseGenerator:
                             if uid not in batch_results:
                                 continue
                             result = batch_results[uid]
-                            self.prompt_cache.insert_cache(
-                                current_model_key, result["cache_key"], prompt_cache
-                            )
+                            if not result.get("stored_prompt_boundary"):
+                                self.prompt_cache.insert_cache(
+                                    current_model_key, result["cache_key"], prompt_cache
+                                )
                             del batch_results[uid]
 
     def _serve_single(self, request):
@@ -968,19 +1086,84 @@ class ResponseGenerator:
             sampler = _make_sampler(args, tokenizer)
             logits_processors = _make_logits_processors(args)
 
-            # Load the KV cache
-            cache, rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_provider.model_key, prompt
+            # Compute content-only token length (without generation prompt)
+            # for boundary cache keying. The generation prompt tokens differ
+            # between a standalone request and a continued conversation, so
+            # we must key by content tokens only for prefix matching to work.
+            model_key = self.model_provider.model_key
+            content_len = len(prompt)
+            if request.request_type == "chat" and tokenizer.has_chat_template:
+                try:
+                    chat_template_args = self.model_provider.cli_args.chat_template_args
+                    if args.chat_template_kwargs:
+                        chat_template_args = chat_template_args.copy()
+                        chat_template_args.update(args.chat_template_kwargs)
+                    content_tokens = tokenizer.apply_chat_template(
+                        request.messages,
+                        tools=request.tools,
+                        add_generation_prompt=False,
+                        tokenize=True,
+                        **chat_template_args,
+                    )
+                    content_len = len(content_tokens)
+                except Exception:
+                    pass  # Fall back to full prompt length
+            gen_prompt_len = len(prompt) - content_len
+
+            # Check prompt-boundary cache (keyed by content tokens, no gen prompt)
+            content_prompt = prompt[:content_len] if gen_prompt_len > 0 else prompt
+            boundary_cache, boundary_rest, boundary_hit_type = (
+                self._boundary_cache_lookup(model_key, content_prompt)
             )
-            ctx.prompt_cache_count = len(prompt) - len(rest)
+
+            if boundary_cache is not None:
+                cache = boundary_cache
+                # rest = remaining content tokens + full generation prompt
+                rest = list(boundary_rest) + prompt[content_len:]
+                ctx.prompt_cache_count = len(prompt) - len(rest)
+                logging.info(
+                    f"Prompt boundary cache {boundary_hit_type}: "
+                    f"{ctx.prompt_cache_count} cached, {len(rest)} remaining"
+                )
+            else:
+                # Fall back to LRU cache (for trimmable/standard models)
+                cache, rest = self.prompt_cache.fetch_nearest_cache(
+                    model_key, prompt
+                )
+                ctx.prompt_cache_count = len(prompt) - len(rest)
+                if cache is None:
+                    cache = make_prompt_cache(self.model_provider.model)
+                    if self.model_provider.draft_model is not None:
+                        cache += make_prompt_cache(self.model_provider.draft_model)
+
             cache_key = prompt[:]
-            if cache is None:
-                cache = make_prompt_cache(self.model_provider.model)
-                if self.model_provider.draft_model is not None:
-                    cache += make_prompt_cache(self.model_provider.draft_model)
 
             ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
             logging.info(f"We have {ncaches} kv caches that take {nbytes/1e9:.2f} GB")
+
+            # Callback to store prompt-boundary snapshot for hybrid models.
+            # Snapshot at content boundary (before generation prompt) so the
+            # cache state doesn't include gen prompt tokens that differ across turns.
+            on_prefill = None
+            prefill_snapshot_at = None
+            stored_prompt_boundary = boundary_hit_type is not None
+            if len(rest) > 0:
+
+                def on_prefill(prefill_cache):
+                    nonlocal stored_prompt_boundary
+                    if not can_trim_prompt_cache(prefill_cache):
+                        snapshot = copy.deepcopy(prefill_cache)
+                        self._boundary_cache_store(
+                            model_key, content_prompt, snapshot
+                        )
+                        stored_prompt_boundary = True
+
+                # Compute snapshot position relative to rest tokens
+                if gen_prompt_len > 0:
+                    # Snapshot after content tokens are processed, before gen prompt
+                    content_remaining = len(rest) - gen_prompt_len
+                    if content_remaining > 0:
+                        prefill_snapshot_at = content_remaining
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -994,6 +1177,8 @@ class ResponseGenerator:
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
+                on_prefill_complete=on_prefill,
+                prefill_snapshot_at=prefill_snapshot_at,
             ):
                 rqueue.put(
                     Response(
@@ -1015,10 +1200,12 @@ class ResponseGenerator:
 
             rqueue.put(None)
 
-            # Save the KV cache again
-            self.prompt_cache.insert_cache(
-                self.model_provider.model_key, cache_key, cache
-            )
+            # Save the KV cache (skip for non-trimmable models —
+            # end-of-gen cache is useless since it can't be trimmed)
+            if not stored_prompt_boundary:
+                self.prompt_cache.insert_cache(
+                    self.model_provider.model_key, cache_key, cache
+                )
 
         except Exception as e:
             rqueue.put(e)
