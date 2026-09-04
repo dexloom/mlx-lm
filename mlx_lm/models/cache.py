@@ -85,11 +85,29 @@ def load_prompt_cache(file_name, return_metadata=False):
     return cache
 
 
-def can_trim_prompt_cache(cache: List[Any]) -> bool:
+def can_trim_prompt_cache(cache: List[Any], n: Optional[int] = None) -> bool:
     """
-    Check if model's cache can be trimmed.
+    Check if model's cache can be trimmed by ``n`` tokens.
+
+    When ``n`` is ``None`` the conservative answer is returned (rotating
+    caches that have wrapped past ``max_size`` report False). When ``n``
+    is provided each cache decides whether *that specific* trim is safe;
+    rotating caches accept any ``n`` that keeps the next-write index
+    within bounds.
     """
-    return all(c.is_trimmable() for c in cache)
+    return all(c.is_trimmable(n) if _accepts_n(c.is_trimmable) else c.is_trimmable() for c in cache)
+
+
+def _accepts_n(fn) -> bool:
+    """Best-effort detection of whether a cache's ``is_trimmable`` takes
+    the optional ``n`` parameter. Lets us stay backward-compatible with
+    out-of-tree cache classes that still use the no-arg signature."""
+    try:
+        import inspect
+        params = inspect.signature(fn).parameters
+        return len(params) >= 1
+    except (TypeError, ValueError):
+        return False
 
 
 def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
@@ -143,7 +161,7 @@ class _BaseCache:
         if v is not None and v:
             raise ValueError("This cache has no meta_state but a meta_state was set.")
 
-    def is_trimmable(self):
+    def is_trimmable(self, n=None):
         return False
 
     def size(self):
@@ -208,7 +226,7 @@ class ConcatenateKVCache(_BaseCache):
         self.keys, self.values = v
         self.offset = self.keys.shape[-2]
 
-    def is_trimmable(self):
+    def is_trimmable(self, n=None):
         return True
 
     def trim(self, n):
@@ -303,7 +321,7 @@ class QuantizedKVCache(_BaseCache):
     def meta_state(self, v):
         self.offset, self.group_size, self.bits = map(int, v)
 
-    def is_trimmable(self):
+    def is_trimmable(self, n=None):
         return True
 
     def trim(self, n):
@@ -372,7 +390,7 @@ class KVCache(_BaseCache):
         self.keys, self.values = v
         self.offset = self.keys.shape[2]
 
-    def is_trimmable(self):
+    def is_trimmable(self, n=None):
         return True
 
     def trim(self, n):
@@ -539,13 +557,55 @@ class RotatingKVCache(_BaseCache):
             v,
         )
 
-    def is_trimmable(self):
-        return self.offset < self.max_size
+    def is_trimmable(self, n=None):
+        # Pre-rotation the buffer holds the full history and any trim up
+        # to ``offset`` is bit-exact.
+        if self.offset < self.max_size:
+            return True
+        # Post-rotation the circular buffer has overwritten the oldest
+        # entries, but we can still safely trim by any ``n`` up to
+        # ``max_size - keep`` — trim() linearises the buffer first
+        # (via ``_temporal_order``) so the rotation state is normalised,
+        # then drops the last ``n`` entries. ``n=None`` keeps the strict
+        # historical answer (False) for callers that don't pass a size.
+        if n is None or not isinstance(n, int) or n < 0:
+            return False
+        if n > self.offset:
+            return False
+        # After linearisation the buffer has ``max_size`` entries in
+        # temporal order; trim drops from the end, so any ``n`` up to
+        # ``max_size - keep`` works.
+        return n <= (self.max_size - self.keep)
 
     def trim(self, n):
         n = min(self.offset, n)
+        if n == 0:
+            return 0
+        # Linearise the buffer when the cache has rotated. Without this,
+        # the metadata-only rewind (decrementing ``offset``/``_idx``)
+        # leaves the physical KV slots in rotation order while
+        # ``_temporal_order`` on the next ``_update_concat`` assumes the
+        # post-trim ``_idx`` describes a rotation that never started —
+        # the buffer ends up jumbled and the model attends over
+        # semantically wrong KV. Linearising materialises the buffer in
+        # absolute temporal order so subsequent ops see a well-defined
+        # post-rotation, pre-rotation-again state.
+        if self.offset >= self.max_size and self.keys is not None:
+            self.keys = self._temporal_order(self.keys)
+            self.values = self._temporal_order(self.values)
+            # After _temporal_order the buffer is linear: slot 0 is the
+            # oldest, slot -1 is the newest, ``_idx`` no longer indexes a
+            # circular slot.
+            self._idx = self.keys.shape[2]
         self.offset -= n
         self._idx -= n
+        # Drop the last ``n`` (now-trailing) slots so the next prefill
+        # sees a buffer whose length matches its post-trim ``_idx``.
+        if self.keys is not None:
+            new_size = self.keys.shape[2] - n
+            if new_size < self.keys.shape[2]:
+                self.keys = self.keys[..., :new_size, :]
+                self.values = self.values[..., :new_size, :]
         return n
 
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
@@ -785,7 +845,7 @@ class ChunkedKVCache(_BaseCache):
         self.keys, self.values = v
         self.offset = self.keys.shape[2]
 
-    def is_trimmable(self):
+    def is_trimmable(self, n=None):
         return True
 
     def trim(self, n):
@@ -818,8 +878,11 @@ class CacheList(_BaseCache):
     def __getitem__(self, idx):
         return self.caches[idx]
 
-    def is_trimmable(self):
-        return all(c.is_trimmable() for c in self.caches)
+    def is_trimmable(self, n=None):
+        return all(
+            c.is_trimmable(n) if _accepts_n(c.is_trimmable) else c.is_trimmable()
+            for c in self.caches
+        )
 
     def trim(self, n):
         for c in self.caches:
@@ -999,7 +1062,7 @@ class BatchKVCache(_BaseCache):
         self.keys, self.values, self.offset, self.left_padding = v
         self._idx = self.keys.shape[2]
 
-    def is_trimmable(self):
+    def is_trimmable(self, n=None):
         return True
 
     def trim(self, n):
@@ -1314,7 +1377,14 @@ class BatchRotatingKVCache(_BaseCache):
         )
         self.rotated = bool(v[3])
 
-    def is_trimmable(self):
+    def is_trimmable(self, n=None):
+        # Conservative for the batched rotating cache: only allow trims
+        # pre-rotation. Post-rotation trims would also need linearisation
+        # of the per-batch rotated buffer plus correct handling of
+        # ``left_padding`` / ``_lengths``; ``RotatingKVCache`` got that
+        # treatment because the single-stream MTP path needs it, but the
+        # batched rotating variant currently has no caller that relies
+        # on post-rotation trims, so we keep the simpler invariant.
         return self._offset < self.max_size
 
     def trim(self, n):
@@ -1680,10 +1750,15 @@ class LRUPromptCache:
         short_length = len(result.shorter) if result.shorter is not None else 0
         if result.longer is not None and result.common_prefix > short_length:
             cache_entry = self._trie.get(result.model, result.longer)
-            if can_trim_prompt_cache(cache_entry.prompt_cache):
+            prefix = min(len(tokens) - 1, result.common_prefix)
+            num_to_trim = len(result.longer) - prefix
+            # Pass the *requested* trim size so rotating caches that have
+            # wrapped past their window can still accept small/in-window
+            # rewinds. Without this, agent flows with prompts longer than
+            # the sliding window get treated as full cache misses because
+            # the rotating slots permanently report ``is_trimmable=False``.
+            if can_trim_prompt_cache(cache_entry.prompt_cache, num_to_trim):
                 cache = copy.deepcopy(cache_entry.prompt_cache)
-                prefix = min(len(tokens) - 1, result.common_prefix)
-                num_to_trim = len(result.longer) - prefix
                 trim_prompt_cache(cache, num_to_trim)
                 return cache, tokens[prefix:]
 
